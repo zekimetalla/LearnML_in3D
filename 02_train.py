@@ -18,6 +18,7 @@ schedule, retrain, rebenchmark, commit, repeat.
 from __future__ import annotations
 import argparse
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 
 from drive2win import nn as nn_mod
 from drive2win import viz
@@ -86,6 +87,18 @@ def gradient_check():
         )
 
 
+def smooth_actions(actions: np.ndarray, sigma: float = 3.0) -> np.ndarray:
+    """Gaussian low-pass filter along the time axis.
+
+    Keyboard (WASD) recording produces discrete {-1, 0, +1} steps. Smoothing
+    converts those into ramps so the model learns proportional control instead
+    of hard snaps. sigma=3 ≈ 0.15 s at 20 Hz — enough to remove the
+    discontinuities without blurring the intent of each manoeuvre.
+    """
+    smoothed = gaussian_filter1d(actions.astype(np.float64), sigma=sigma, axis=0)
+    return np.clip(smoothed, -1.0, 1.0).astype(np.float32)
+
+
 def inspect_dataset(states_raw, actions, tag: str):
     print("\nfeature ranges (raw):")
     for i, name in enumerate(FEATURE_NAMES):
@@ -137,6 +150,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--smooth", type=float, default=0.0,
+                    help="Gaussian sigma for action smoothing (0 = off). "
+                         "Try 3.0 to fix discrete WASD targets.")
     args = ap.parse_args()
 
     d = np.load(args.data, allow_pickle=False)
@@ -148,6 +164,10 @@ def main():
 
     X = normalize_states(states_raw)
     Y = actions.astype(np.float32)
+    if args.smooth > 0.0:
+        Y = smooth_actions(Y, sigma=args.smooth)
+        print(f"actions smoothed (sigma={args.smooth}): "
+              f"std {actions.std():.3f} → {Y.std():.3f}")
     print(f"\nX range : [{X.min():+.2f}, {X.max():+.2f}]")
     print(f"Y range : [{Y.min():+.2f}, {Y.max():+.2f}]")
 
