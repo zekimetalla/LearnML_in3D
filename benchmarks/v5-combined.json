@@ -1,0 +1,61 @@
+{
+  "tag": "v5-combined",
+  "weights": "nav_v5-combined.npz",
+  "module": "drive2win.smooth_mlp",
+  "runs_per_seed": 5,
+  "duration_s": 60.0,
+  "seeds": [
+    {
+      "seed": 42,
+      "summary": {
+        "n_runs": 5,
+        "completion_rate": 0.0,
+        "median_lap_time": Infinity,
+        "mean_crashes": 0.0,
+        "max_checkpoints": 0
+      },
+      "runs": [
+        {
+          "steps": 0,
+          "elapsed": 60.022149085998535,
+          "checkpoints_passed": 0,
+          "crashes": 0,
+          "min_speed_streak": 0,
+          "track": []
+        },
+        {
+          "steps": 0,
+          "elapsed": 60.021713972091675,
+          "checkpoints_passed": 0,
+          "crashes": 0,
+          "min_speed_streak": 0,
+          "track": []
+        },
+        {
+          "steps": 0,
+          "elapsed": 60.05215001106262,
+          "checkpoints_passed": 0,
+          "crashes": 0,
+          "min_speed_streak": 0,
+          "track": []
+        },
+        {
+          "steps": 0,
+          "elapsed": 60.01629114151001,
+          "checkpoints_passed": 0,
+          "crashes": 0,
+          "min_speed_streak": 0,
+          "track": []
+        },
+        {
+          "steps": 0,
+          "elapsed": 60.009907960891724,
+          "checkpoints_passed": 0,
+          "crashes": 0,
+          "min_speed_streak": 0,
+          "track": []
+        }
+      ]
+    }
+  ]
+}
