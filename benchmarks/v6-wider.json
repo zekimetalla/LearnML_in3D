@@ -17,7 +17,7 @@
       "runs": [
         {
           "steps": 0,
-          "elapsed": 60.03537726402283,
+          "elapsed": 60.00956916809082,
           "checkpoints_passed": 0,
           "crashes": 0,
           "min_speed_streak": 0,
@@ -25,7 +25,7 @@
         },
         {
           "steps": 0,
-          "elapsed": 60.030522108078,
+          "elapsed": 60.05092191696167,
           "checkpoints_passed": 0,
           "crashes": 0,
           "min_speed_streak": 0,
@@ -33,7 +33,7 @@
         },
         {
           "steps": 0,
-          "elapsed": 60.05119204521179,
+          "elapsed": 60.040417194366455,
           "checkpoints_passed": 0,
           "crashes": 0,
           "min_speed_streak": 0,
@@ -41,7 +41,7 @@
         },
         {
           "steps": 0,
-          "elapsed": 60.05220985412598,
+          "elapsed": 60.01988363265991,
           "checkpoints_passed": 0,
           "crashes": 0,
           "min_speed_streak": 0,
@@ -49,7 +49,7 @@
         },
         {
           "steps": 0,
-          "elapsed": 60.02444076538086,
+          "elapsed": 60.02750587463379,
           "checkpoints_passed": 0,
           "crashes": 0,
           "min_speed_streak": 0,
