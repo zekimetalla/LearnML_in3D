@@ -105,8 +105,8 @@ def inspect_dataset(states_raw, actions, tag: str):
         col = states_raw[:, i]
         print(f"  {name:>20s}: [{col.min():+7.2f}, {col.max():+7.2f}]   "
               f"mean={col.mean():+.2f}  std={col.std():.2f}")
-    viz.plot_action_histograms(actions, out=f"fig_actions_{tag}.png")
-    viz.plot_heading_vs_steering(states_raw, actions, out=f"fig_heading_{tag}.png")
+    viz.plot_action_histograms(actions, out=f"figures/fig_actions_{tag}.png")
+    viz.plot_heading_vs_steering(states_raw, actions, out=f"figures/fig_heading_{tag}.png")
 
 
 def train(X, Y, epochs=300, lr=1e-3, batch_size=64, val_frac=0.1, seed=0):
@@ -160,6 +160,7 @@ def main():
     print(f"raw states  : {states_raw.shape}")
     print(f"raw actions : {actions.shape}")
 
+    import os; os.makedirs("figures", exist_ok=True)
     inspect_dataset(states_raw, actions, tag=args.tag)
 
     X = normalize_states(states_raw)
@@ -176,7 +177,7 @@ def main():
     weights, tr_losses, va_losses = train(
         X, Y, epochs=args.epochs, lr=args.lr, batch_size=args.batch)
 
-    viz.plot_loss_curves(tr_losses, va_losses, out=f"fig_loss_{args.tag}.png")
+    viz.plot_loss_curves(tr_losses, va_losses, out=f"figures/fig_loss_{args.tag}.png")
     nn_mod.save(weights, f"nav_{args.tag}.npz")
     print(f"Saved nav_{args.tag}.npz")
 
