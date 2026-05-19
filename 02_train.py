@@ -113,7 +113,14 @@ def inject_nav_data(states_raw: np.ndarray, actions: np.ndarray,
     while keeping all recorded recovery/wall-avoidance behaviour.
     """
     rng = np.random.default_rng(seed)
-    idx = rng.choice(len(states_raw), size=n, replace=True)
+    # only sample from open-path states (front ray > 10m) so we don't
+    # override wall-avoidance situations with proportional steering
+    front_ray = states_raw[:, 3]   # ray_0_front, raw metres
+    open_mask = front_ray > 10.0
+    open_idx  = np.where(open_mask)[0]
+    if len(open_idx) < n:
+        open_idx = np.concatenate([open_idx] * (n // len(open_idx) + 1))
+    idx = rng.choice(open_idx, size=n, replace=False)
     syn_states  = states_raw[idx].copy()
 
     # heading_error is feature index 1, already in [-pi, pi]
