@@ -99,6 +99,36 @@ def smooth_actions(actions: np.ndarray, sigma: float = 3.0) -> np.ndarray:
     return np.clip(smoothed, -1.0, 1.0).astype(np.float32)
 
 
+def inject_nav_data(states_raw: np.ndarray, actions: np.ndarray,
+                    n: int = 8000, gain: float = 0.8, seed: int = 1) -> tuple:
+    """Inject synthetic proportional-navigation samples.
+
+    WASD data has contradictory steering labels for the same heading_error
+    (sometimes left, sometimes straight, sometimes right) so the model averages
+    them to zero and ignores heading_error entirely.
+
+    Fix: sample real sensor states, replace their actions with the analytic
+    proportional rule  steering = -heading_error_norm * gain,  throttle = 0.8.
+    Mixing these with real data gives the model an unambiguous navigation signal
+    while keeping all recorded recovery/wall-avoidance behaviour.
+    """
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(states_raw), size=n, replace=True)
+    syn_states  = states_raw[idx].copy()
+
+    # heading_error is feature index 1, already in [-pi, pi]
+    # normalize.py divides by pi → [-1, 1]; replicate that here for the rule
+    heading_norm = np.clip(syn_states[:, 1] / np.pi, -1.0, 1.0)
+    syn_steering  = np.clip(-heading_norm * gain, -1.0, 1.0).astype(np.float32)
+    syn_throttle  = np.full(n, 0.8, dtype=np.float32)
+    syn_actions   = np.stack([syn_throttle, syn_steering], axis=1)
+
+    combined_states  = np.concatenate([states_raw, syn_states],  axis=0)
+    combined_actions = np.concatenate([actions,    syn_actions],  axis=0)
+    print(f"  injected {n:,} synthetic nav samples (gain={gain})")
+    return combined_states, combined_actions
+
+
 def inspect_dataset(states_raw, actions, tag: str):
     print("\nfeature ranges (raw):")
     for i, name in enumerate(FEATURE_NAMES):
@@ -153,6 +183,9 @@ def main():
     ap.add_argument("--smooth", type=float, default=0.0,
                     help="Gaussian sigma for action smoothing (0 = off). "
                          "Try 3.0 to fix discrete WASD targets.")
+    ap.add_argument("--nav-inject", type=int, default=0,
+                    help="Number of synthetic proportional-nav samples to inject. "
+                         "Try 8000 to fix heading/steering correlation.")
     args = ap.parse_args()
 
     d = np.load(args.data, allow_pickle=False)
@@ -169,6 +202,9 @@ def main():
         Y = smooth_actions(Y, sigma=args.smooth)
         print(f"actions smoothed (sigma={args.smooth}): "
               f"std {actions.std():.3f} → {Y.std():.3f}")
+    if args.nav_inject > 0:
+        states_raw, Y = inject_nav_data(states_raw, Y, n=args.nav_inject)
+        X = normalize_states(states_raw)
     print(f"\nX range : [{X.min():+.2f}, {X.max():+.2f}]")
     print(f"Y range : [{Y.min():+.2f}, {Y.max():+.2f}]")
 
