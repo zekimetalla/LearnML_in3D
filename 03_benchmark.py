@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--data", default=None,
                     help="Optional data_<tag>.npz for the training-vs-test path "
                          "overlay.")
+    ap.add_argument("--no-obstacles", action="store_true",
+                    help="Disable arena obstacles (match --no-obstacles in collect).")
     args = ap.parse_args()
 
     weights = args.weights or f"nav_{args.tag}.npz"
@@ -51,6 +53,7 @@ def main():
         result = run_benchmark(
             weights=weights, runs=args.runs, seed=seed,
             duration=args.duration, module=args.module,
+            obstacles=not args.no_obstacles,
         )
         all_results.append({"seed": seed, **result})
 

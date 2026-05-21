@@ -127,8 +127,7 @@ def inject_nav_data(states_raw: np.ndarray, actions: np.ndarray,
     # normalize.py divides by pi → [-1, 1]; replicate that here for the rule
     heading_norm = np.clip(syn_states[:, 1] / np.pi, -1.0, 1.0)
     syn_steering  = np.clip(-heading_norm * gain, -1.0, 1.0).astype(np.float32)
-    syn_throttle  = np.full(n, 0.8, dtype=np.float32)
-    syn_actions   = np.stack([syn_throttle, syn_steering], axis=1)
+    syn_actions   = syn_steering.reshape(-1, 1)  # steering only
 
     combined_states  = np.concatenate([states_raw, syn_states],  axis=0)
     combined_actions = np.concatenate([actions,    syn_actions],  axis=0)
@@ -193,6 +192,8 @@ def main():
     ap.add_argument("--nav-inject", type=int, default=0,
                     help="Number of synthetic proportional-nav samples to inject. "
                          "Try 8000 to fix heading/steering correlation.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Random seed for weight init and train/val split.")
     args = ap.parse_args()
 
     d = np.load(args.data, allow_pickle=False)
@@ -204,11 +205,11 @@ def main():
     inspect_dataset(states_raw, actions, tag=args.tag)
 
     X = normalize_states(states_raw)
-    Y = actions.astype(np.float32)
+    Y = actions[:, 1:2].astype(np.float32)  # steering only
     if args.smooth > 0.0:
         Y = smooth_actions(Y, sigma=args.smooth)
         print(f"actions smoothed (sigma={args.smooth}): "
-              f"std {actions.std():.3f} → {Y.std():.3f}")
+              f"std {actions[:, 1].std():.3f} → {Y.std():.3f}")
     if args.nav_inject > 0:
         states_raw, Y = inject_nav_data(states_raw, Y, n=args.nav_inject)
         X = normalize_states(states_raw)
@@ -218,7 +219,7 @@ def main():
     gradient_check()
 
     weights, tr_losses, va_losses = train(
-        X, Y, epochs=args.epochs, lr=args.lr, batch_size=args.batch)
+        X, Y, epochs=args.epochs, lr=args.lr, batch_size=args.batch, seed=args.seed)
 
     viz.plot_loss_curves(tr_losses, va_losses, out=f"figures/fig_loss_{args.tag}.png")
     nn_mod.save(weights, f"nav_{args.tag}.npz")

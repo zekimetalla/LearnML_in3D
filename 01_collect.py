@@ -53,13 +53,16 @@ def main():
                     help="Map seed. Same seed across iterations keeps the "
                          "comparison clean; vary it once you want to test "
                          "generalisation across different terrains.")
+    ap.add_argument("--no-obstacles", action="store_true",
+                    help="Disable arena obstacles for clean navigation data.")
     args = ap.parse_args()
 
     client = GameClient(SERVER_URL, API_KEY)
     session = client.create_session(
         mode="time_trial",
         player_name=f"d2w_collector_{args.tag}",
-        config={"seed": args.seed, "wind_enabled": False},
+        config={"seed": args.seed, "wind_enabled": False,
+                "obstacles_enabled": not args.no_obstacles},
     )
     print("Open this URL in a NEW TAB and click into it so WASD reach the game:")
     print(" ", session.get("browser_url"))
