@@ -34,7 +34,7 @@ from .normalize import sensors_to_input, clip_action
 DEFAULT_SEED = 42
 DEFAULT_RUNS = 5
 DEFAULT_DURATION = 60.0
-TARGET_CHECKPOINTS = 8  # one full lap on the default time-trial course
+TARGET_CHECKPOINTS = 12  # one full lap on the default time-trial course
 
 
 def make_mlp_policy(weights_path: str):
@@ -66,7 +66,7 @@ def make_module_policy(module_path: str, weights_path: str):
 def run_benchmark(weights: str, runs: int = DEFAULT_RUNS, seed: int = DEFAULT_SEED,
                   duration: float = DEFAULT_DURATION, module: str | None = None,
                   server_url: str = "https://ml.ferit.tech", api_key: str = "None",
-                  player_name: str = "benchmark") -> dict:
+                  player_name: str = "benchmark", obstacles: bool = False) -> dict:
     """Run `runs` benchmark laps and return aggregate metrics.
 
     The seed is sent to the server so terrain/checkpoint layout is
@@ -84,7 +84,7 @@ def run_benchmark(weights: str, runs: int = DEFAULT_RUNS, seed: int = DEFAULT_SE
             session = client.create_session(
                 mode="time_trial",
                 player_name=f"{player_name}_run{i+1}",
-                config={"seed": seed, "wind_enabled": False},
+                config={"seed": seed, "wind_enabled": False, "obstacles_enabled": obstacles},
             )
             client.connect_ws()
             time.sleep(0.6)
