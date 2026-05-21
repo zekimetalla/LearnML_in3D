@@ -41,6 +41,10 @@ class GameClient:
         self._latest_state = None
         self._state_lock = threading.Lock()
         self._callbacks = {}
+        # Cached static world-map snapshot (terrain IDs, elevations, obstacles,
+        # checkpoints). Populated by cache_world_map(); enables get_grid_local()
+        # to compute the heading-aligned 32×32 grid offline at 20 Hz.
+        self._world_map = None
 
         # Use a requests.Session for persistent headers
         self._http = requests.Session()
@@ -163,6 +167,149 @@ class GameClient:
         data = resp.json()
         grid = np.array(data["grid"]["data"])  # (32, 32, 4)
         return grid.transpose(2, 0, 1)  # → (4, 32, 32) channels-first
+
+    def cache_world_map(self, force: bool = False) -> dict:
+        """
+        Download the static world-map snapshot for local grid computation.
+
+        Pulls the full 100x100 terrain grid (terrain IDs, elevations,
+        obstacles) and checkpoint positions once per session. Subsequent
+        get_grid_local() calls build the 32x32 heading-aligned grid from this
+        cache without any server round-trip — sub-millisecond per call.
+
+        Args:
+            force: Re-download even if a snapshot is already cached.
+
+        Returns:
+            The cached snapshot dict (also stored on self._world_map).
+
+        Caveats:
+            * The snapshot is *static*. Modes that mutate terrain at runtime
+              (anomaly_arena, or any call to configure(terrain_seed=...)) will
+              invalidate it. In anomaly_arena, keep using get_grid_observation()
+              instead. After reconfiguring the seed, call cache_world_map(force=True).
+            * Channels 0-2 are derived from the snapshot; channel 3
+              (nav gradient) is recomputed each tick from live position +
+              checkpoint index, so it stays correct as the agent advances.
+        """
+        if self._world_map is not None and not force:
+            return self._world_map
+        self._check_session()
+        resp = self._http.get(
+            f"{self.server_url}/api/session/{self.session_id}/sensors/world_map"
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        gs = int(raw["grid_size"])
+        cache = {
+            "resolution": float(raw["resolution"]),
+            "world_size": float(raw["world_size"]),
+            "grid_size": gs,
+            "x_min": float(raw["x_min"]),
+            "z_min": float(raw["z_min"]),
+            "terrain_ids": np.asarray(raw["terrain_ids"], dtype=np.float32).reshape(gs, gs),
+            "elevations": np.asarray(raw["elevations"], dtype=np.float32).reshape(gs, gs),
+            "obstacles": np.asarray(raw["obstacles"], dtype=np.float32).reshape(gs, gs),
+            "checkpoints": list(raw.get("checkpoints", []) or []),
+            "world_version": int(raw.get("world_version", 0)),
+        }
+        self._world_map = cache
+        return cache
+
+    def get_grid_local(self) -> np.ndarray:
+        """
+        Build the 32x32x4 CNN grid locally from the cached world snapshot.
+
+        Identical shape and normalization to get_grid_observation(), but
+        computed from cached arrays + the latest WS state — no per-tick
+        network round-trip. Designed for 20 Hz inference loops where the
+        REST/WS round-trip of get_grid_observation() is too slow.
+
+        Returns:
+            numpy array of shape (4, 32, 32), channels-first.
+            Channel 0: terrain type, Channel 1: elevation,
+            Channel 2: obstacles, Channel 3: navigation gradient.
+
+        Requires:
+            * connect_ws() called and at least one state broadcast received,
+              so self._latest_state holds the live position + heading.
+            * cache_world_map() called once (auto-invoked on first use).
+
+        Caveat: snapshot is static — see cache_world_map() docstring. In
+        anomaly_arena mode, fall back to get_grid_observation().
+        """
+        if self._world_map is None:
+            self.cache_world_map()
+        cache = self._world_map
+
+        with self._state_lock:
+            state = self._latest_state
+        if state is None:
+            raise RuntimeError(
+                "no live state yet — call connect_ws() and wait one tick"
+            )
+
+        pos = state.get("position") or {}
+        px = float(pos.get("x", 0.0))
+        pz = float(pos.get("z", 0.0))
+        heading = float(state.get("heading", 0.0))
+
+        sensors = state.get("sensors") or {}
+        nav = sensors.get("navigation") or {}
+        cps_completed = int(nav.get("checkpoints_completed", 0))
+
+        # 32×32 heading-aligned cell centers in world space — mirror of
+        # SensorSystem.getGrid32x32 in src/agents/SensorSystem.ts.
+        GRID = 32
+        CELL = 2.0
+        HALF = (GRID - 1) / 2.0  # 15.5
+        cols = np.arange(GRID, dtype=np.float32)
+        rows = np.arange(GRID, dtype=np.float32)
+        cc, rr = np.meshgrid(cols, rows)
+        local_x = (cc - HALF) * CELL
+        local_z = (rr - HALF) * CELL
+        cos_h = float(np.cos(heading))
+        sin_h = float(np.sin(heading))
+        world_x = px + local_x * cos_h - local_z * sin_h
+        world_z = pz + local_x * sin_h + local_z * cos_h
+
+        # Nearest-neighbor sample of the 100×100 snapshot. The server's
+        # internal terrain grid resolution (2 units/cell) matches grid32's
+        # cell size exactly, so this is exact, not approximate.
+        res = cache["resolution"]
+        gs = cache["grid_size"]
+        ix = np.floor((world_x - cache["x_min"]) / res).astype(np.int32)
+        iz = np.floor((world_z - cache["z_min"]) / res).astype(np.int32)
+        ix_c = np.clip(ix, 0, gs - 1)
+        iz_c = np.clip(iz, 0, gs - 1)
+
+        terrain = cache["terrain_ids"][iz_c, ix_c]
+        elev = cache["elevations"][iz_c, ix_c]
+        obs = cache["obstacles"][iz_c, ix_c]
+
+        # Cells outside ±100 are obstacles, matching the server's bounds check.
+        oob = (np.abs(world_x) > 100) | (np.abs(world_z) > 100)
+        obs = np.where(oob, 1.0, obs).astype(np.float32)
+
+        ch0 = (terrain / 6.0).astype(np.float32)
+        MIN_H = -4.0
+        MAX_H = 4.0
+        ch1 = np.clip((elev - MIN_H) / (MAX_H - MIN_H), 0.0, 1.0).astype(np.float32)
+        ch2 = obs
+
+        checkpoints = cache["checkpoints"]
+        if checkpoints:
+            target = checkpoints[cps_completed % len(checkpoints)]["position"]
+            tx = float(target.get("x", 0.0))
+            tz = float(target.get("z", 0.0))
+            dx = world_x - tx
+            dz = world_z - tz
+            dist = np.sqrt(dx * dx + dz * dz)
+            ch3 = np.clip(1.0 - dist / 200.0, 0.0, 1.0).astype(np.float32)
+        else:
+            ch3 = np.zeros_like(ch0, dtype=np.float32)
+
+        return np.stack([ch0, ch1, ch2, ch3], axis=0)
 
     def get_sensor_history(self, count: int = 100) -> list:
         """
@@ -388,12 +535,18 @@ class GameClient:
 
     # ── Recording (Behavioral Cloning) ──────────────────────────────────
 
-    def start_recording(self, sample_rate: int = 20) -> dict:
+    def start_recording(
+        self, sample_rate: int = 20, include_grid: bool = False
+    ) -> dict:
         """
         Start recording (state, action) pairs for behavioral cloning.
 
         Args:
             sample_rate: Samples per second (default: 20)
+            include_grid: When True, also capture the 32x32x4 terrain grid per
+                sample. Useful for CNN training. Adds ~5 MB per minute of
+                recording at 20 Hz — fine over localhost; expect a slower
+                download for long captures.
 
         Returns:
             Confirmation dict
@@ -401,7 +554,7 @@ class GameClient:
         self._check_session()
         resp = self._http.post(
             f"{self.server_url}/api/session/{self.session_id}/recording/start",
-            json={"sample_rate": sample_rate},
+            json={"sample_rate": sample_rate, "include_grid": include_grid},
         )
         resp.raise_for_status()
         return resp.json()
@@ -455,6 +608,68 @@ class GameClient:
             states.append(state_vec)
             actions.append(action_vec)
         return np.array(states, dtype=np.float32), np.array(actions, dtype=np.float32)
+
+    def get_recording_positions(self) -> np.ndarray:
+        """
+        Download the recorded agent positions as a numpy array.
+
+        Useful for plotting a high-Hz training path (denser than the 1 Hz
+        polled track from `eval.run_policy`).
+
+        Returns:
+            np.ndarray of shape (N, 2) — columns are [x, z].
+        """
+        recording = self.get_recording()
+        positions = []
+        for sample in recording["samples"]:
+            s = sample["state"]
+            positions.append([s.get("position_x", 0.0), s.get("position_z", 0.0)])
+        return np.array(positions, dtype=np.float32)
+
+    def get_recording_with_grid(self) -> tuple:
+        """
+        Download a grid-enabled recording and return arrays for CNN training.
+
+        Call `start_recording(..., include_grid=True)` first; without that
+        flag the per-sample grid will be missing and this method raises.
+
+        Returns:
+            (states, actions, grid_stack) where:
+            - states: np.ndarray of shape (N, 12) — same 12-feat vector as
+              `get_recording_as_arrays`
+            - actions: np.ndarray of shape (N, 2) — [throttle, steering]
+            - grid_stack: np.ndarray of shape (N, 32, 32, 4) — per-sample
+              terrain grid (heading-aligned). Bandwidth: ~5 MB per minute at
+              20 Hz; expect a slower download for long captures.
+        """
+        recording = self.get_recording()
+        states = []
+        actions = []
+        grids = []
+        for sample in recording["samples"]:
+            s = sample["state"]
+            if "grid32" not in s:
+                raise RuntimeError(
+                    "recording has no grid32 samples — start with "
+                    "start_recording(include_grid=True)"
+                )
+            state_vec = [
+                s["speed"],
+                s["heading_error"],
+                s["checkpoint_distance"],
+                *s["rays"],
+                s["ground_friction"],
+            ]
+            action_vec = [sample["action"]["throttle"], sample["action"]["steering"]]
+            states.append(state_vec)
+            actions.append(action_vec)
+            grids.append(s["grid32"])
+        grid_stack = np.array(grids, dtype=np.float32).reshape(-1, 32, 32, 4)
+        return (
+            np.array(states, dtype=np.float32),
+            np.array(actions, dtype=np.float32),
+            grid_stack,
+        )
 
     # ── Map & Exploration ───────────────────────────────────────────────
 
