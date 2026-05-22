@@ -135,6 +135,64 @@ def inject_nav_data(states_raw: np.ndarray, actions: np.ndarray,
     return combined_states, combined_actions
 
 
+def add_path_features(states_raw: np.ndarray, positions: np.ndarray,
+                      lookahead: int = 5) -> tuple:
+    """Interpolate positions to match states length, compute path-relative features.
+
+    Returns (extended_states (N,15), pos_aligned (N,2)).
+    New cols: dir_x, dir_z (direction to lookahead point), dist (distance).
+    """
+    from scipy.interpolate import interp1d
+    N = len(states_raw)
+    t_pos    = np.linspace(0, 1, len(positions))
+    t_states = np.linspace(0, 1, N)
+    pos_aligned = interp1d(t_pos, positions, axis=0)(t_states).astype(np.float32)
+    future_pos  = pos_aligned[np.clip(np.arange(N) + lookahead, 0, N - 1)]
+    direction   = (future_pos - pos_aligned).astype(np.float32)
+    dist        = np.linalg.norm(direction, axis=1, keepdims=True).astype(np.float32)
+    extended    = np.concatenate([states_raw, direction, dist], axis=1)
+    print(f"  path features: dir=[{direction.min():.1f},{direction.max():.1f}]  "
+          f"dist=[{dist.min():.1f},{dist.max():.1f}]")
+    return extended, pos_aligned
+
+
+def augment_with_noise(X: np.ndarray, Y: np.ndarray,
+                       state_std: float = 0.01, action_std: float = 0.02,
+                       seed: int = 42) -> tuple:
+    """Double dataset by adding small Gaussian noise (teaches recovery)."""
+    rng = np.random.default_rng(seed)
+    Xn  = np.clip(X + rng.normal(0, state_std,  X.shape).astype(np.float32), -1.0, 1.0)
+    Yn  = np.clip(Y + rng.normal(0, action_std, Y.shape).astype(np.float32), -1.0, 1.0)
+    print(f"  noise augmentation: {len(X):,} → {len(X)*2:,} samples")
+    return np.concatenate([X, Xn]), np.concatenate([Y, Yn])
+
+
+def balance_steering(X: np.ndarray, Y: np.ndarray,
+                     straight_keep: float = 0.35, seed: int = 7) -> tuple:
+    """Undersample near-zero steering to reduce straight-driving bias."""
+    rng      = np.random.default_rng(seed)
+    straight = np.abs(Y[:, 0]) < 0.1
+    keep_str = rng.choice(np.where(straight)[0],
+                          size=int(straight.sum() * straight_keep), replace=False)
+    idx = np.sort(np.concatenate([np.where(~straight)[0], keep_str]))
+    print(f"  steering balance: {len(Y):,} → {len(idx):,} "
+          f"(kept {straight_keep*100:.0f}% of near-zero)")
+    return X[idx], Y[idx]
+
+
+def fix_contradictory_labels(states_raw: np.ndarray, actions: np.ndarray,
+                              heading_thresh: float = 0.3,
+                              steer_thresh: float = 0.1,
+                              gain: float = 0.8) -> np.ndarray:
+    """Replace steering=0 where heading_error is significant."""
+    actions = actions.copy()
+    heading_norm = np.clip(states_raw[:, 1] / np.pi, -1.0, 1.0)
+    bad = (np.abs(states_raw[:, 1]) > heading_thresh) & (np.abs(actions[:, 1]) < steer_thresh)
+    actions[bad, 1] = np.clip(-heading_norm[bad] * gain, -1.0, 1.0).astype(np.float32)
+    print(f"  fixed {bad.sum()} contradictory labels ({bad.mean()*100:.0f}% of data)")
+    return actions
+
+
 def inspect_dataset(states_raw, actions, tag: str):
     print("\nfeature ranges (raw):")
     for i, name in enumerate(FEATURE_NAMES):
@@ -190,10 +248,20 @@ def main():
                     help="Gaussian sigma for action smoothing (0 = off). "
                          "Try 3.0 to fix discrete WASD targets.")
     ap.add_argument("--nav-inject", type=int, default=0,
-                    help="Number of synthetic proportional-nav samples to inject. "
-                         "Try 8000 to fix heading/steering correlation.")
+                    help="Number of synthetic proportional-nav samples to inject.")
+    ap.add_argument("--nav-gain", type=float, default=0.8,
+                    help="Steering gain for nav injection (1.0 = full correction).")
     ap.add_argument("--seed", type=int, default=0,
                     help="Random seed for weight init and train/val split.")
+    ap.add_argument("--path-features", action="store_true",
+                    help="Add path-relative features (dir_x, dir_z, dist). "
+                         "Requires positions field in .npz. Sets N_IN=12.")
+    ap.add_argument("--fix-labels", action="store_true",
+                    help="Replace contradictory steering labels.")
+    ap.add_argument("--augment", action="store_true",
+                    help="Double dataset with Gaussian noise (recovery learning).")
+    ap.add_argument("--balance", action="store_true",
+                    help="Undersample near-zero steering to reduce straight bias.")
     args = ap.parse_args()
 
     d = np.load(args.data, allow_pickle=False)
@@ -204,17 +272,39 @@ def main():
     import os; os.makedirs("figures", exist_ok=True)
     inspect_dataset(states_raw, actions, tag=args.tag)
 
-    X = normalize_states(states_raw)
+    if args.fix_labels:
+        actions = fix_contradictory_labels(states_raw, actions)
+
+    if args.path_features:
+        if "positions" not in d.files:
+            raise ValueError("--path-features requires a 'positions' field in the .npz file.")
+        states_raw, pos_aligned = add_path_features(states_raw, d["positions"])
+        # save reference path alongside weights for inference
+        np.save(f"path_ref_{args.tag}.npy", pos_aligned)
+        print(f"  saved path_ref_{args.tag}.npy for inference")
+
+    X = normalize_states(states_raw[:, :12])  # sensor features only (first 12 cols)
+    if args.path_features:
+        from drive2win.normalize import normalize_path_features
+        X = np.concatenate([X, normalize_path_features(states_raw[:, 12:])], axis=1)
+
     Y = actions[:, 1:2].astype(np.float32)  # steering only
     if args.smooth > 0.0:
         Y = smooth_actions(Y, sigma=args.smooth)
-        print(f"actions smoothed (sigma={args.smooth}): "
+        print(f"  actions smoothed (sigma={args.smooth}): "
               f"std {actions[:, 1].std():.3f} → {Y.std():.3f}")
     if args.nav_inject > 0:
-        states_raw, Y = inject_nav_data(states_raw, Y, n=args.nav_inject)
-        X = normalize_states(states_raw)
-    print(f"\nX range : [{X.min():+.2f}, {X.max():+.2f}]")
-    print(f"Y range : [{Y.min():+.2f}, {Y.max():+.2f}]")
+        states_raw, Y = inject_nav_data(states_raw, Y, n=args.nav_inject, gain=args.nav_gain)
+        X_new = normalize_states(states_raw[:, :12])
+        if args.path_features:
+            X_new = np.concatenate([X_new, normalize_path_features(states_raw[:, 12:])], axis=1)
+        X = X_new
+    if args.balance:
+        X, Y = balance_steering(X, Y)
+    if args.augment:
+        X, Y = augment_with_noise(X, Y)
+    print(f"\nX shape: {X.shape}  range=[{X.min():+.2f},{X.max():+.2f}]")
+    print(f"Y shape: {Y.shape}  range=[{Y.min():+.2f},{Y.max():+.2f}]")
 
     gradient_check()
 

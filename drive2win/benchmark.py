@@ -34,7 +34,7 @@ from .normalize import sensors_to_input, clip_action
 DEFAULT_SEED = 42
 DEFAULT_RUNS = 5
 DEFAULT_DURATION = 60.0
-TARGET_CHECKPOINTS = 12  # one full lap on the default time-trial course
+TARGET_CHECKPOINTS = 11  # one full lap on the default time-trial course
 
 
 def make_mlp_policy(weights_path: str):
