@@ -29,6 +29,10 @@ PHASES = [
     ("Recovery",          60, "Drive into walls, get stuck, back out, turn around. DO NOT SKIP."),
 ]
 
+QUICK_PHASES = [
+    ("Focused laps", 90, "Drive clean laps hitting every checkpoint precisely."),
+]
+
 
 def _poll_positions(client: GameClient, stop_evt: threading.Event,
                     out: list, hz: float = 5.0):
@@ -55,6 +59,8 @@ def main():
                          "generalisation across different terrains.")
     ap.add_argument("--no-obstacles", action="store_true",
                     help="Disable arena obstacles for clean navigation data.")
+    ap.add_argument("--quick", action="store_true",
+                    help="Single 90-second phase — use to top up data for specific CPs.")
     args = ap.parse_args()
 
     client = GameClient(SERVER_URL, API_KEY)
@@ -78,8 +84,9 @@ def main():
                          daemon=True)
     t.start()
 
+    phases = QUICK_PHASES if args.quick else PHASES
     client.start_recording(sample_rate=20)
-    for i, (name, seconds, hint) in enumerate(PHASES, 1):
+    for i, (name, seconds, hint) in enumerate(phases, 1):
         print(f"\n--- Phase {i}/{len(PHASES)} — {name} ({seconds}s) ---")
         print(f"  {hint}")
         print(f"  Driving for {seconds}s; switch to the browser tab now.")
@@ -98,8 +105,9 @@ def main():
     pos_arr = np.array([(p[1], p[2]) for p in positions], dtype=np.float32)
     print(f"positions shape: {pos_arr.shape}     (M, 2)  — low-Hz path samples")
 
-    assert states_raw.shape[0] >= 5_000, (
-        "Fewer than 5,000 samples. Drive more before saving."
+    min_samples = 1_000 if args.quick else 5_000
+    assert states_raw.shape[0] >= min_samples, (
+        f"Fewer than {min_samples} samples. Drive more before saving."
     )
 
     out = f"data_{args.tag}.npz"
