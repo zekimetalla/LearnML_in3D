@@ -16,7 +16,7 @@ import numpy as np
 from drive2win import nn
 from drive2win.normalize import sensors_to_input
 
-THROTTLE         = 0.8
+THROTTLE         = 0.9
 STEER_GAIN       = 1.4   # was 1.9 — lower to stop violent CP overshoots
 STUCK_THRESHOLD  = 15
 REVERSE_FRAMES   = 10
@@ -28,11 +28,12 @@ PURE_STUCK_SPEED = 0.15
 CP_HOMING_DIST   = 50.0  # metres — start blending steering toward checkpoint
 CP_HOMING_MAX    = 1.0   # max steering blend during approach — full override at gate
 CP_HOMING_GAIN   = 5.0
-CP_BRAKE_DIST    = 15.0  # metres — start braking toward checkpoint
-CP_MIN_THROTTLE  = 0.5   # throttle at gate
+CP_BRAKE_DIST    = 10.0  # metres — start braking toward checkpoint
+CP_MIN_THROTTLE  = 0.55  # throttle at gate
 CP_GATE_DIST     = 5.0   # within this: 100% heading correction to thread the gate
 CP_ORBIT_DIST    = 8.0   # retreat detection zone (must be > CP_GATE_DIST)
 CP_ORBIT_FRAMES  = 25    # frames stuck near CP before forcing a reverse (~1.25 s at 20 Hz)
+
 
 
 def _load_path_ref(weights_path: str) -> np.ndarray | None:
@@ -54,6 +55,7 @@ def _path_features(pos_xz: np.ndarray, path_ref: np.ndarray,
     delta   = future - pos_xz
     dist    = float(np.linalg.norm(delta))
     return np.array([delta[0], delta[1], dist], dtype=np.float32)
+
 
 
 def make_policy(weights_path: str):
