@@ -15,11 +15,152 @@ Usage:
 """
 
 import json
+import math
 import time
 import threading
 import numpy as np
 import requests
 import websocket
+
+
+# Ground-friction lookup keyed by terrain ID (mirror of TERRAIN_TYPES in
+# shared/types.ts). Same values, same order: grass, dirt, sand, mud, ice,
+# rock, pavement.
+TERRAIN_FRICTION = {0: 1.0, 1: 0.9, 2: 0.8, 3: 0.7, 4: 0.4, 5: 1.2, 6: 1.1}
+
+# Ray angles in degrees, ported verbatim from src/agents/SensorSystem.ts:
+# RAYCAST_ANGLES. 0 = forward, increasing CCW relative to heading.
+RAYCAST_ANGLES_DEG = (0, 45, 90, 135, 180, 225, 270, 315)
+RAYCAST_MAX_RANGE = 50.0
+
+
+def _parse_world_map_payload(raw: dict) -> dict:
+    """Convert a WorldMapSnapshot JSON payload into the numpy-backed dict
+    used by _compute_grid_local() and _compute_rays_8().
+
+    Mirrors GameClient.cache_world_map's old inline body so both the
+    single-player client and RoomBot build the same cache structure.
+    """
+    gs = int(raw["grid_size"])
+    return {
+        "resolution": float(raw["resolution"]),
+        "world_size": float(raw["world_size"]),
+        "grid_size": gs,
+        "x_min": float(raw["x_min"]),
+        "z_min": float(raw["z_min"]),
+        "terrain_ids": np.asarray(raw["terrain_ids"], dtype=np.float32).reshape(gs, gs),
+        "elevations": np.asarray(raw["elevations"], dtype=np.float32).reshape(gs, gs),
+        "obstacles": np.asarray(raw["obstacles"], dtype=np.float32).reshape(gs, gs),
+        "checkpoints": list(raw.get("checkpoints", []) or []),
+        "world_version": int(raw.get("world_version", 0)),
+    }
+
+
+def _compute_grid_local(cache: dict, px: float, pz: float, heading: float, cps_completed: int) -> np.ndarray:
+    """Build the 32×32×4 heading-aligned CNN grid from a cached snapshot.
+
+    Same math as the original GameClient.get_grid_local — extracted as a free
+    function so RoomBot can reuse it without holding a session.
+    """
+    GRID = 32
+    CELL = 2.0
+    HALF = (GRID - 1) / 2.0  # 15.5
+    cols = np.arange(GRID, dtype=np.float32)
+    rows = np.arange(GRID, dtype=np.float32)
+    cc, rr = np.meshgrid(cols, rows)
+    local_x = (cc - HALF) * CELL
+    local_z = (rr - HALF) * CELL
+    cos_h = float(np.cos(heading))
+    sin_h = float(np.sin(heading))
+    world_x = px + local_x * cos_h - local_z * sin_h
+    world_z = pz + local_x * sin_h + local_z * cos_h
+
+    res = cache["resolution"]
+    gs = cache["grid_size"]
+    ix = np.floor((world_x - cache["x_min"]) / res).astype(np.int32)
+    iz = np.floor((world_z - cache["z_min"]) / res).astype(np.int32)
+    ix_c = np.clip(ix, 0, gs - 1)
+    iz_c = np.clip(iz, 0, gs - 1)
+
+    terrain = cache["terrain_ids"][iz_c, ix_c]
+    elev = cache["elevations"][iz_c, ix_c]
+    obs = cache["obstacles"][iz_c, ix_c]
+
+    oob = (np.abs(world_x) > 100) | (np.abs(world_z) > 100)
+    obs = np.where(oob, 1.0, obs).astype(np.float32)
+
+    ch0 = (terrain / 6.0).astype(np.float32)
+    MIN_H = -4.0
+    MAX_H = 4.0
+    ch1 = np.clip((elev - MIN_H) / (MAX_H - MIN_H), 0.0, 1.0).astype(np.float32)
+    ch2 = obs
+
+    checkpoints = cache["checkpoints"]
+    if checkpoints:
+        target = checkpoints[cps_completed % len(checkpoints)]["position"]
+        tx = float(target.get("x", 0.0))
+        tz = float(target.get("z", 0.0))
+        dx = world_x - tx
+        dz = world_z - tz
+        dist = np.sqrt(dx * dx + dz * dz)
+        ch3 = np.clip(1.0 - dist / 200.0, 0.0, 1.0).astype(np.float32)
+    else:
+        ch3 = np.zeros_like(ch0, dtype=np.float32)
+
+    return np.stack([ch0, ch1, ch2, ch3], axis=0)
+
+
+def _compute_rays_8(cache: dict, px: float, pz: float, heading: float,
+                    max_dist: float = RAYCAST_MAX_RANGE) -> list:
+    """8-direction obstacle raycast against the cached obstacle grid.
+
+    Replica of SensorSystem.getRaycasts, but using the cached 100×100
+    obstacle map instead of a Rapier physics world. Direction convention
+    matches the TS source exactly:
+        dirX = -sin(angleRad + heading)
+        dirZ = -cos(angleRad + heading)
+    so angle 0 == "forward" relative to the bot.
+
+    Returns a list of 8 floats (world units), each in [0, max_dist].
+    """
+    res = float(cache["resolution"])
+    gs = int(cache["grid_size"])
+    x_min = float(cache["x_min"])
+    z_min = float(cache["z_min"])
+    obstacles = cache["obstacles"]
+
+    # Step at quarter-cell granularity — well under the cell width so we
+    # don't skip past thin obstacles. At res=2 that's 0.5 world units,
+    # giving ~1% precision vs the 50-unit max range (the parity target
+    # mentioned in the tournament plan).
+    step = 0.5
+    n_steps = int(max_dist / step) + 1
+
+    distances = []
+    for angle_deg in RAYCAST_ANGLES_DEG:
+        angle_rad = (angle_deg * math.pi) / 180.0 + heading
+        dir_x = -math.sin(angle_rad)
+        dir_z = -math.cos(angle_rad)
+
+        hit_dist = max_dist
+        for k in range(1, n_steps + 1):
+            d = k * step
+            wx = px + dir_x * d
+            wz = pz + dir_z * d
+            if abs(wx) > 100 or abs(wz) > 100:
+                hit_dist = d
+                break
+            ix = int(math.floor((wx - x_min) / res))
+            iz = int(math.floor((wz - z_min) / res))
+            if ix < 0 or ix >= gs or iz < 0 or iz >= gs:
+                hit_dist = d
+                break
+            if obstacles[iz, ix] >= 0.5:
+                hit_dist = d
+                break
+        distances.append(float(min(hit_dist, max_dist)))
+
+    return distances
 
 
 class GameClient:
@@ -199,20 +340,7 @@ class GameClient:
             f"{self.server_url}/api/session/{self.session_id}/sensors/world_map"
         )
         resp.raise_for_status()
-        raw = resp.json()
-        gs = int(raw["grid_size"])
-        cache = {
-            "resolution": float(raw["resolution"]),
-            "world_size": float(raw["world_size"]),
-            "grid_size": gs,
-            "x_min": float(raw["x_min"]),
-            "z_min": float(raw["z_min"]),
-            "terrain_ids": np.asarray(raw["terrain_ids"], dtype=np.float32).reshape(gs, gs),
-            "elevations": np.asarray(raw["elevations"], dtype=np.float32).reshape(gs, gs),
-            "obstacles": np.asarray(raw["obstacles"], dtype=np.float32).reshape(gs, gs),
-            "checkpoints": list(raw.get("checkpoints", []) or []),
-            "world_version": int(raw.get("world_version", 0)),
-        }
+        cache = _parse_world_map_payload(resp.json())
         self._world_map = cache
         return cache
 
@@ -258,58 +386,7 @@ class GameClient:
         nav = sensors.get("navigation") or {}
         cps_completed = int(nav.get("checkpoints_completed", 0))
 
-        # 32×32 heading-aligned cell centers in world space — mirror of
-        # SensorSystem.getGrid32x32 in src/agents/SensorSystem.ts.
-        GRID = 32
-        CELL = 2.0
-        HALF = (GRID - 1) / 2.0  # 15.5
-        cols = np.arange(GRID, dtype=np.float32)
-        rows = np.arange(GRID, dtype=np.float32)
-        cc, rr = np.meshgrid(cols, rows)
-        local_x = (cc - HALF) * CELL
-        local_z = (rr - HALF) * CELL
-        cos_h = float(np.cos(heading))
-        sin_h = float(np.sin(heading))
-        world_x = px + local_x * cos_h - local_z * sin_h
-        world_z = pz + local_x * sin_h + local_z * cos_h
-
-        # Nearest-neighbor sample of the 100×100 snapshot. The server's
-        # internal terrain grid resolution (2 units/cell) matches grid32's
-        # cell size exactly, so this is exact, not approximate.
-        res = cache["resolution"]
-        gs = cache["grid_size"]
-        ix = np.floor((world_x - cache["x_min"]) / res).astype(np.int32)
-        iz = np.floor((world_z - cache["z_min"]) / res).astype(np.int32)
-        ix_c = np.clip(ix, 0, gs - 1)
-        iz_c = np.clip(iz, 0, gs - 1)
-
-        terrain = cache["terrain_ids"][iz_c, ix_c]
-        elev = cache["elevations"][iz_c, ix_c]
-        obs = cache["obstacles"][iz_c, ix_c]
-
-        # Cells outside ±100 are obstacles, matching the server's bounds check.
-        oob = (np.abs(world_x) > 100) | (np.abs(world_z) > 100)
-        obs = np.where(oob, 1.0, obs).astype(np.float32)
-
-        ch0 = (terrain / 6.0).astype(np.float32)
-        MIN_H = -4.0
-        MAX_H = 4.0
-        ch1 = np.clip((elev - MIN_H) / (MAX_H - MIN_H), 0.0, 1.0).astype(np.float32)
-        ch2 = obs
-
-        checkpoints = cache["checkpoints"]
-        if checkpoints:
-            target = checkpoints[cps_completed % len(checkpoints)]["position"]
-            tx = float(target.get("x", 0.0))
-            tz = float(target.get("z", 0.0))
-            dx = world_x - tx
-            dz = world_z - tz
-            dist = np.sqrt(dx * dx + dz * dz)
-            ch3 = np.clip(1.0 - dist / 200.0, 0.0, 1.0).astype(np.float32)
-        else:
-            ch3 = np.zeros_like(ch0, dtype=np.float32)
-
-        return np.stack([ch0, ch1, ch2, ch3], axis=0)
+        return _compute_grid_local(cache, px, pz, heading, cps_completed)
 
     def get_sensor_history(self, count: int = 100) -> list:
         """
@@ -939,6 +1016,412 @@ class GameClient:
     def __exit__(self, *args):
         self.disconnect_ws()
         self.delete_session()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Tournament client — RoomBot
+#
+#  Connects to a multiplayer room's bot channel (/ws/room/bot). Different
+#  lifecycle from GameClient: no HTTP session creation, no admin browser
+#  ownership — just join a room by name, signal ready, drive when round_start
+#  fires. Reuses _parse_world_map_payload, _compute_grid_local, and
+#  _compute_rays_8 so the observation a controller sees in a tournament
+#  matches what students trained on with GameClient.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _quat_to_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
+    """Extract yaw (heading) from a quaternion using THREE.js YXZ Euler
+    order — matches Agent.getHeading() exactly. See src/agents/Agent.ts:100.
+    """
+    # YXZ extraction: heading = atan2(-m20, m22) where
+    #   m20 = 2*(x*z - w*y), m22 = 1 - 2*(x*x + y*y)
+    sy = 2.0 * (qw * qy - qx * qz)
+    cy = 1.0 - 2.0 * (qx * qx + qy * qy)
+    return math.atan2(sy, cy)
+
+
+def _wrap_pi(a: float) -> float:
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+class RoomBot:
+    """Tournament client. Plug a controller in, call run(), drive until the
+    tournament ends.
+
+    Example:
+        from game_client import RoomBot
+
+        def my_controller(obs):
+            # obs is a dict — see TOURNAMENT.md for the full schema
+            return 0.7, obs["navigation"]["heading_error"] * 0.4
+
+        bot = RoomBot("https://ml.ferit.tech", room="demo", name="Alice",
+                      api_key="mlsim_abc123")
+        standings = bot.run(my_controller, hz=20.0)
+        print(standings)
+    """
+
+    def __init__(
+        self,
+        server_url: str = "https://ml.ferit.tech",
+        room: str = "main",
+        name: str = "bot",
+        api_key: str = None,
+    ):
+        self.server_url = server_url.rstrip("/")
+        self.room = room
+        self.name = name
+        self.api_key = api_key
+
+        self._ws = None
+        self._ws_thread = None
+        self._stop = threading.Event()
+        self._connected = threading.Event()
+
+        # Latest message-derived state, written by the WS thread, read by the
+        # control loop. All access through this lock.
+        self._lock = threading.Lock()
+        self._bot_key = None
+        self._phase = "lobby"          # lobby/countdown/racing/round_end/finished
+        self._round_index = 0
+        self._latest_bots = []         # list of RoomBotState dicts
+        self._latest_state_t = 0
+        self._world_map = None
+        self._world_map_round = -1
+        self._standings = []
+        self._tournament_done = False
+        self._last_pos_for_speed = None  # (x, z, t) for speed estimation
+        self._last_speed = 0.0
+
+        # HTTP session for the world_map fetch.
+        self._http = requests.Session()
+        if api_key:
+            self._http.headers["X-API-Key"] = api_key
+
+    # ── public API ─────────────────────────────────────────────────────
+
+    def run(self, controller, hz: float = 20.0) -> list:
+        """Connect, ready up, drive at `hz` until tournament_end.
+
+        Args:
+            controller: Callable taking an `obs` dict and returning
+                (throttle, steering) — both in [-1, 1].
+            hz: Control tick rate.
+
+        Returns:
+            Final standings list (each entry is the TournamentStanding dict
+            broadcast by the server).
+        """
+        if self._ws is None:
+            self._connect()
+        # Wait briefly for the bot_assigned + initial snapshot before the
+        # tick loop runs — otherwise the first few ticks would have no state.
+        self._connected.wait(timeout=5.0)
+
+        period = 1.0 / hz
+        dt_warn_threshold = 0.100  # 100 ms — log if controller is too slow
+        avg_dt = period
+        next_tick = time.time()
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    done = self._tournament_done
+                if done:
+                    break
+                t0 = time.time()
+                obs = self._build_obs()
+                if obs is not None:
+                    try:
+                        out = controller(obs)
+                        throttle, steering = float(out[0]), float(out[1])
+                    except Exception as e:
+                        # Defensive: a buggy controller shouldn't crash the
+                        # tournament — coast instead and keep going.
+                        print(f"[RoomBot:{self.name}] controller error: {e}")
+                        throttle, steering = 0.0, 0.0
+                    # Only send control while a round is actually running.
+                    if self._phase == "racing":
+                        self._send_control(throttle, steering)
+                # Frame budget + slowness warning
+                dt = time.time() - t0
+                avg_dt = 0.9 * avg_dt + 0.1 * dt
+                if avg_dt > dt_warn_threshold:
+                    print(f"[RoomBot:{self.name}] WARNING: controller avg dt {avg_dt*1000:.0f}ms "
+                          f"exceeds budget — frames will drop")
+                    avg_dt = period  # reset so warning isn't spammy
+                next_tick += period
+                sleep_for = next_tick - time.time()
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                else:
+                    next_tick = time.time()  # we're behind — resync
+        except KeyboardInterrupt:
+            print(f"[RoomBot:{self.name}] interrupted")
+        finally:
+            self.disconnect()
+        return list(self._standings)
+
+    def disconnect(self) -> None:
+        self._stop.set()
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+    # ── WS lifecycle ───────────────────────────────────────────────────
+
+    def _connect(self) -> None:
+        ws_scheme = "wss" if self.server_url.startswith("https") else "ws"
+        host = self.server_url.split("//", 1)[1]
+        ws_url = f"{ws_scheme}://{host}/ws/room/bot?room={self.room}&name={self.name}"
+        if self.api_key:
+            ws_url += f"&api_key={self.api_key}"
+
+        self._ws = websocket.WebSocketApp(
+            ws_url,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+        self._ws_thread = threading.Thread(target=self._ws.run_forever, daemon=True)
+        self._ws_thread.start()
+
+    def _on_open(self, ws):
+        print(f"[RoomBot:{self.name}] connected to room '{self.room}' — signaling ready")
+        try:
+            ws.send(json.dumps({"type": "ready", "ready": True}))
+        except Exception:
+            pass
+
+    def _on_message(self, ws, raw):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        t = msg.get("type")
+        if t == "bot_assigned":
+            with self._lock:
+                self._bot_key = msg.get("bot_key")
+                rs = msg.get("room_state") or {}
+                self._phase = rs.get("phase", "lobby")
+                self._round_index = int(rs.get("round_index", 0))
+            print(f"[RoomBot:{self.name}] bot_key={self._bot_key}")
+            self._connected.set()
+        elif t == "round_start":
+            ridx = int(msg.get("round_index", 0))
+            with self._lock:
+                self._phase = "racing"
+                self._round_index = ridx
+                self._last_pos_for_speed = None
+                self._last_speed = 0.0
+            print(f"[RoomBot:{self.name}] round_start idx={ridx} seed={msg.get('seed')} "
+                  f"obstacles={msg.get('obstacles')}")
+            # Fetch the world map for this round (terrain + obstacles).
+            self._fetch_world_map(ridx)
+        elif t == "state_update":
+            bots = msg.get("bots") or []
+            with self._lock:
+                self._latest_bots = bots
+                self._latest_state_t = int(msg.get("t", 0))
+        elif t == "round_end":
+            with self._lock:
+                self._phase = "round_end"
+            print(f"[RoomBot:{self.name}] round_end idx={msg.get('round_index')}")
+        elif t == "tournament_end":
+            standings = msg.get("standings") or []
+            with self._lock:
+                self._phase = "finished"
+                self._standings = standings
+                self._tournament_done = True
+            print(f"[RoomBot:{self.name}] tournament_end")
+            for r in standings:
+                print(f"  #{r.get('rank')} {r.get('name')} cps={r.get('total_checkpoints')}")
+        elif t == "error":
+            code = msg.get("code")
+            print(f"[RoomBot:{self.name}] error: {code} {msg.get('message')}")
+            # Auth errors are unrecoverable — bail out so the user notices.
+            if code in ("auth_failed", "unauthorized", "forbidden"):
+                self._stop.set()
+
+    def _on_error(self, ws, err):
+        print(f"[RoomBot:{self.name}] ws error: {err}")
+
+    def _on_close(self, ws, code, reason):
+        print(f"[RoomBot:{self.name}] disconnected ({code} {reason})")
+        # Releasing the connected event lets a still-waiting run() exit
+        # instead of hanging forever if the server drops us pre-assignment.
+        self._connected.set()
+        self._stop.set()
+
+    # ── observation building ───────────────────────────────────────────
+
+    def _fetch_world_map(self, round_index: int) -> None:
+        """GET /api/room/<room>/world_map and cache the parsed snapshot."""
+        url = f"{self.server_url}/api/room/{self.room}/world_map"
+        try:
+            # First attempt may race the admin browser's race-start — retry a few times.
+            for attempt in range(5):
+                resp = self._http.get(url, timeout=3.0)
+                if resp.status_code == 200:
+                    cache = _parse_world_map_payload(resp.json())
+                    with self._lock:
+                        self._world_map = cache
+                        self._world_map_round = round_index
+                    print(f"[RoomBot:{self.name}] cached world_map for round {round_index}")
+                    return
+                if resp.status_code in (404, 504):
+                    time.sleep(0.5)
+                    continue
+                resp.raise_for_status()
+            print(f"[RoomBot:{self.name}] world_map fetch failed after retries (last status {resp.status_code})")
+        except Exception as e:
+            print(f"[RoomBot:{self.name}] world_map fetch error: {e}")
+
+    def _self_state(self) -> dict:
+        """Find this bot's RoomBotState in the latest state_update."""
+        with self._lock:
+            bot_key = self._bot_key
+            bots = list(self._latest_bots)
+        if not bot_key:
+            return None
+        for b in bots:
+            if b.get("bot_key") == bot_key:
+                return b
+        return None
+
+    def _other_bots(self) -> list:
+        with self._lock:
+            bot_key = self._bot_key
+            bots = list(self._latest_bots)
+        return [b for b in bots if b.get("bot_key") != bot_key]
+
+    def _build_obs(self) -> dict:
+        self_state = self._self_state()
+        if self_state is None:
+            return None
+        pos = self_state.get("position") or {}
+        rot = self_state.get("rotation") or {}
+        px = float(pos.get("x", 0.0))
+        py = float(pos.get("y", 0.0))
+        pz = float(pos.get("z", 0.0))
+        heading = _quat_to_yaw(
+            float(rot.get("x", 0.0)),
+            float(rot.get("y", 0.0)),
+            float(rot.get("z", 0.0)),
+            float(rot.get("w", 1.0)),
+        )
+
+        # Finite-difference speed estimator. Matches Agent.getSpeed() (which
+        # ignores the Y component) by only using x/z deltas.
+        now = time.time()
+        with self._lock:
+            last = self._last_pos_for_speed
+        if last is None:
+            speed = 0.0
+        else:
+            lx, lz, lt = last
+            dt = max(now - lt, 1e-3)
+            speed = math.sqrt((px - lx) ** 2 + (pz - lz) ** 2) / dt
+            # Low-pass: room state arrives at ~20 Hz so per-tick deltas are
+            # noisy. A light EMA keeps the value usable for BC inference.
+            speed = 0.6 * speed + 0.4 * self._last_speed
+        with self._lock:
+            self._last_pos_for_speed = (px, pz, now)
+            self._last_speed = speed
+
+        cps_completed = int(self_state.get("checkpoints", 0))
+
+        # Pull cached world map. If not yet fetched (first ticks of round 0),
+        # serve zeroed sensors so the controller can still run.
+        with self._lock:
+            cache = self._world_map
+            round_idx = self._round_index
+            phase = self._phase
+
+        if cache is not None:
+            rays = _compute_rays_8(cache, px, pz, heading)
+            ground_friction = self._lookup_ground_friction(cache, px, pz)
+            grid32 = _compute_grid_local(cache, px, pz, heading, cps_completed)
+            navigation = self._compute_navigation(cache, px, pz, heading, cps_completed)
+        else:
+            rays = [RAYCAST_MAX_RANGE] * 8
+            ground_friction = 1.0
+            grid32 = np.zeros((4, 32, 32), dtype=np.float32)
+            navigation = {"distance": 0.0, "heading_error": 0.0, "checkpoint_index": 0}
+
+        return {
+            "position": {"x": px, "y": py, "z": pz},
+            "heading": heading,
+            "speed": float(speed),
+            "rays": rays,
+            "ground_friction": float(ground_friction),
+            "grid32": grid32,
+            "navigation": navigation,
+            "checkpoints_passed": cps_completed,
+            "round_index": round_idx,
+            "race_phase": phase,
+            "other_bots": self._other_bots(),
+        }
+
+    def _lookup_ground_friction(self, cache: dict, px: float, pz: float) -> float:
+        res = float(cache["resolution"])
+        gs = int(cache["grid_size"])
+        ix = int(math.floor((px - float(cache["x_min"])) / res))
+        iz = int(math.floor((pz - float(cache["z_min"])) / res))
+        if ix < 0 or ix >= gs or iz < 0 or iz >= gs:
+            return 1.0  # outside the world — friction undefined, default to grass
+        tid = int(cache["terrain_ids"][iz, ix])
+        return TERRAIN_FRICTION.get(tid, 1.0)
+
+    def _compute_navigation(self, cache: dict, px: float, pz: float, heading: float, cps_completed: int) -> dict:
+        """Mirror of CheckpointSystem.getNavigationInfo — same atan2(-dx,-dz)
+        target-angle convention, same wrap to [-π, π]."""
+        checkpoints = cache.get("checkpoints") or []
+        if not checkpoints:
+            return {"distance": 0.0, "heading_error": 0.0, "checkpoint_index": 0}
+        idx = cps_completed % len(checkpoints)
+        target = checkpoints[idx].get("position") or {}
+        tx = float(target.get("x", 0.0))
+        tz = float(target.get("z", 0.0))
+        dx = tx - px
+        dz = tz - pz
+        distance = math.sqrt(dx * dx + dz * dz)
+        target_angle = math.atan2(-dx, -dz)
+        heading_error = _wrap_pi(target_angle - heading)
+        return {
+            "distance": float(distance),
+            "heading_error": float(heading_error),
+            "checkpoint_index": int(idx),
+        }
+
+    def _send_control(self, throttle: float, steering: float) -> None:
+        if self._ws is None:
+            return
+        try:
+            self._ws.send(json.dumps({
+                "type": "control",
+                "throttle": float(np.clip(throttle, -1.0, 1.0)),
+                "steering": float(np.clip(steering, -1.0, 1.0)),
+            }))
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.disconnect()
+
+    def __repr__(self) -> str:
+        return f"RoomBot({self.server_url}, room={self.room}, name={self.name})"
 
     def __repr__(self):
         status = f"session={self.session_id}" if self.session_id else "no session"

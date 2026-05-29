@@ -25,6 +25,9 @@ RAY_WEDGE        = 4.0
 PURE_STUCK_THR   = 50
 PURE_STUCK_SPEED = 0.15
 
+PROGRESS_WINDOW  = 60   # frames with no CP progress before reversing (~3 s at 20 Hz)
+PROGRESS_MIN     = 1.0  # metres — min CP distance change to count as progress
+
 CP_HOMING_DIST   = 50.0  # metres — start blending steering toward checkpoint
 CP_HOMING_MAX    = 1.0   # max steering blend during approach — full override at gate
 CP_HOMING_GAIN   = 5.0
@@ -33,6 +36,8 @@ CP_MIN_THROTTLE  = 0.55  # throttle at gate
 CP_GATE_DIST     = 5.0   # within this: 100% heading correction to thread the gate
 CP_ORBIT_DIST    = 8.0   # retreat detection zone (must be > CP_GATE_DIST)
 CP_ORBIT_FRAMES  = 25    # frames stuck near CP before forcing a reverse (~1.25 s at 20 Hz)
+
+OBS_DIST         = 8.0   # metres — isolated obstacle detection threshold
 
 
 
@@ -63,14 +68,17 @@ def make_policy(weights_path: str):
     path_ref = _load_path_ref(weights_path)
     use_path = (path_ref is not None) and (w["W1"].shape[0] == 12)
 
-    prev          = np.zeros(1, dtype=np.float32)
-    stuck_count   = 0
-    reverse_count = 0
-    prev_cp_dist  = 100.0
-    orbit_frames  = 0
+    prev              = np.zeros(1, dtype=np.float32)
+    stuck_count       = 0
+    reverse_count     = 0
+    prev_cp_dist      = 100.0
+    orbit_frames      = 0
+    progress_ref_dist = 100.0
+    no_progress_count = 0
 
     def policy(state: dict) -> tuple[float, float]:
-        nonlocal prev, stuck_count, reverse_count, prev_cp_dist, orbit_frames
+        nonlocal prev, stuck_count, reverse_count, prev_cp_dist, orbit_frames, \
+                 progress_ref_dist, no_progress_count
 
         sensors = state["sensors"]
         speed   = sensors.get("speed", 1.0)
@@ -91,6 +99,18 @@ def make_policy(weights_path: str):
         if stuck_count >= (STUCK_THRESHOLD if wedged else PURE_STUCK_THR):
             reverse_count = REVERSE_FRAMES
             stuck_count   = 0
+
+        # no-progress detector: catches ramps, geometry traps, invisible walls
+        cp_dist_now = sensors.get("checkpoint_distance", 100.0)
+        if abs(cp_dist_now - progress_ref_dist) > PROGRESS_MIN:
+            progress_ref_dist = cp_dist_now
+            no_progress_count = 0
+        else:
+            no_progress_count += 1
+        if no_progress_count >= PROGRESS_WINDOW and reverse_count == 0:
+            reverse_count     = REVERSE_FRAMES * 2
+            no_progress_count = 0
+            progress_ref_dist = cp_dist_now
 
         # orbit detector: been near CP too long without passing → force reverse escape
         cp_near = sensors.get("checkpoint_distance", 100.0) < CP_ORBIT_DIST
@@ -153,6 +173,22 @@ def make_policy(weights_path: str):
                 throttle = CP_MIN_THROTTLE + (THROTTLE - CP_MIN_THROTTLE) * brake_t
             else:
                 throttle = THROTTLE
+
+        # --- obstacle avoidance (only fires for isolated obstacles, not track walls) ---
+        # Condition: front blocked AND at least one 45° ray sees further → gap exists
+        front_left  = rays[7] if len(rays) > 7 else 50.0
+        front_right = rays[1] if len(rays) > 1 else 50.0
+        if front < OBS_DIST and max(front_left, front_right) > front:
+            heading_err_obs = sensors.get("heading_error", 0.0)
+            candidates = [(-np.pi / 4, front_left), (0.0, front), (np.pi / 4, front_right)]
+            best_score, best_angle = -1.0, 0.0
+            for angle, dist in candidates:
+                score = dist * max(0.1, float(np.cos(angle + heading_err_obs)))
+                if score > best_score:
+                    best_score, best_angle = score, angle
+            gap_steer = float(np.clip(best_angle / (np.pi / 2), -1.0, 1.0))
+            t_obs     = float(np.clip(1.0 - front / OBS_DIST, 0.0, 0.4))
+            steer     = steer * (1.0 - t_obs) + gap_steer * t_obs
 
         return (throttle, steer)
 

@@ -36,7 +36,7 @@ def main():
                     help="Map seed(s) to test on. Use one for fast iteration; "
                          "use several to test generalisation across terrains.")
     ap.add_argument("--runs", type=int, default=5)
-    ap.add_argument("--duration", type=float, default=60.0)
+    ap.add_argument("--duration", type=float, default=180.0)
     ap.add_argument("--data", default=None,
                     help="Optional data_<tag>.npz for the training-vs-test path "
                          "overlay.")
